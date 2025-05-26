@@ -56,6 +56,7 @@ class FromManiskill2(embodied.Env):
       obs_mode = 'pointcloud' # this detours using pointcloud wrapper of maniskill
 
     name = env
+    self._name = name
     self.model_ids = None
     if "TurnFaucet" in name:
         self.model_ids = ["5002", "5004", "5005", "5007"]
@@ -103,7 +104,7 @@ class FromManiskill2(embodied.Env):
             )
     else:
         raise NotImplemented("Version should be either v0 or v1.")
-
+    self._env = env
 
     self.size = size
     # self._env = CPUGymWrapper(self._env)
