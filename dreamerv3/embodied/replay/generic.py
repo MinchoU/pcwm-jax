@@ -24,6 +24,8 @@ class Generic:
     self.counters = defaultdict(int)
     self.table = {}
     self.online = online
+    self.excludes = ["raw_pointcloud", "render_image", "world_pointcloud", "obs_frame_pose"]
+
     if self.online:
       self.online_queue = deque()
       self.online_stride = length
@@ -60,7 +62,7 @@ class Generic:
     return stats
 
   def add(self, step, worker=0, load=False):
-    step = {k: v for k, v in step.items() if not k.startswith('log_')}
+    step = {k: v for k, v in step.items() if not k.startswith('log_') and k not in self.excludes}
     step['id'] = np.asarray(embodied.uuid(step.get('id')))
     stream = self.streams[worker]
     stream.append(step)

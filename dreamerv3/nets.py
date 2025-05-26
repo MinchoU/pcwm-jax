@@ -18,7 +18,7 @@ class RSSM(nj.Module):
 
   def __init__(
       self, deter=1024, stoch=32, classes=32, unroll=False, initial='learned',
-      unimix=0.01, action_clip=1.0, **kw):
+      unimix=0.01, action_clip=1.0, multi_step_length=0, shift=False,**kw):
     self._deter = deter
     self._stoch = stoch
     self._classes = classes
@@ -26,6 +26,9 @@ class RSSM(nj.Module):
     self._initial = initial
     self._unimix = unimix
     self._action_clip = action_clip
+    self.multi_step_length = multi_step_length
+    self._shift = shift 
+
     self._kw = kw
 
   def initial(self, bs):
@@ -57,10 +60,79 @@ class RSSM(nj.Module):
     step = lambda prev, inputs: self.obs_step(prev[0], *inputs)
     inputs = swap(action), swap(embed), swap(is_first)
     start = state, state
+
     post, prior = jaxutils.scan(step, inputs, start, self._unroll)
     post = {k: swap(v) for k, v in post.items()}
     prior = {k: swap(v) for k, v in prior.items()}
-    return post, prior
+
+    if self.multi_step_length <= 0:
+      return post, prior, {}
+  
+    H = self.multi_step_length
+    T = action.shape[1]
+
+    valid_starts = T - H + (1-self._shift)
+    if valid_starts <= 0:
+        empty_rollout = {k: jnp.array([]).reshape(0, 0, *v.shape[2:]) 
+                        for k, v in prior.items()}
+        return post, prior, empty_rollout
+    
+    def single_rollout(t):
+        state_t = {k: v[:, t] for k, v in prior.items()}
+        
+        act_t = jax.lax.dynamic_slice(
+            action, 
+            start_indices=(0, t+self._shift, 0),
+            slice_sizes=(action.shape[0], H, action.shape[2])
+        )
+
+        prior_t = self.imagine(act_t, state_t)
+        return prior_t
+    
+    t_indices = jnp.arange(valid_starts)
+    all_rollouts = jax.vmap(single_rollout)(t_indices)
+    
+    if len(all_rollouts['deter']) > H:
+        rollouts = {k: v[H:] for k, v in all_rollouts.items()}
+    else:
+        rollouts = {k: jnp.array([]).reshape(0, *v.shape[1:]) 
+                   for k, v in all_rollouts.items()}
+    
+    rollout_state = {k: jnp.transpose(v, (1, 0, 2) + tuple(range(3, len(v.shape))))
+                    for k, v in rollouts.items()}
+
+    return post, prior, rollout_state
+
+    # valid_starts = T - H + 1
+    # assert valid_starts > 0
+    
+    # def single_rollout(t):
+    #     state_t = {k: v[:, t] for k, v in prior.items()}
+        
+    #     act_t = jax.lax.dynamic_slice(
+    #         action, 
+    #         start_indices=(0, t, 0), 
+    #         slice_sizes=(action.shape[0], H, action.shape[2])
+    #     )
+
+    #     prior_t = self.imagine(act_t, state_t)
+    #     return prior_t
+    
+    # t_indices = jnp.arange(valid_starts)
+    # all_rollouts = jax.vmap(single_rollout)(t_indices)
+    
+    # if len(all_rollouts['deter']) > H:
+    #     # rollouts = {k: v[H:] for k, v in all_rollouts.items()}
+    #     rollouts = jax.tree_util.tree_map(lambda x: x[H:], all_rollouts)
+    # else:
+    #     rollouts = {k: jnp.array([]).reshape(0, *v.shape[1:]) 
+    #                for k, v in all_rollouts.items()}
+    
+    # rollout_state = jax.tree_util.tree_map(
+    #     lambda x: jnp.transpose(x, (1, 0, 2) + tuple(range(3, len(x.shape)))),
+    #     rollouts)
+    
+    # return post, prior, rollout_state
 
   def imagine(self, action, state=None):
     swap = lambda x: x.transpose([1, 0] + list(range(2, len(x.shape))))
@@ -213,7 +285,7 @@ class MultiEncoder(nj.Module):
     if self.mlp_shapes:
       self._mlp = MLP(None, mlp_layers, mlp_units, dist='none', **mlp_kw)
 
-  def __call__(self, data):
+  def __call__(self, data, mode='train'):
     some_key, some_shape = list(self.shapes.items())[0]
     batch_dims = data[some_key].shape[:-len(some_shape)]
     data = {
@@ -626,6 +698,7 @@ class Input:
     if not all(k in inputs for k in self._keys):
       needs = f'{{{", ".join(self._keys)}}}'
       found = f'{{{", ".join(inputs.keys())}}}'
+      breakpoint()
       raise KeyError(f'Cannot find keys {needs} among inputs {found}.')
     values = [inputs[k] for k in self._keys]
     dims = len(inputs[self._dims].shape)

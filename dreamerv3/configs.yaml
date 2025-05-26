@@ -54,7 +54,7 @@ defaults:
     minecraft: {size: [64, 64], break_speed: 100.0}
     dmc: {size: [64, 64], repeat: 2, camera: -1}
     loconav: {size: [64, 64], repeat: 2, camera: -1}
-
+    maniskill2: {size: [128, 128], repeat: 2, obs_mode: "rgb", control_mode: pd_joint_delta_pos, cam_name: "hand_camera", depth_max_mm: 1000, obs_frame: "tcp_pose", n_downsample_pts: 1024, use_segmented_pts: False}
   # Agent
   task_behavior: Greedy
   expl_behavior: None
@@ -69,7 +69,7 @@ defaults:
   decoder: {mlp_keys: '.*', cnn_keys: '.*', act: silu, norm: layer, mlp_layers: 5, mlp_units: 1024, cnn: resnet, cnn_depth: 96, cnn_blocks: 0, image_dist: mse, vector_dist: symlog_mse, inputs: [deter, stoch], resize: stride, winit: normal, fan: avg, outscale: 1.0, minres: 4, cnn_sigmoid: False}
   reward_head: {layers: 5, units: 1024, act: silu, norm: layer, dist: symlog_disc, outscale: 0.0, outnorm: False, inputs: [deter, stoch], winit: normal, fan: avg, bins: 255}
   cont_head: {layers: 5, units: 1024, act: silu, norm: layer, dist: binary, outscale: 1.0, outnorm: False, inputs: [deter, stoch], winit: normal, fan: avg}
-  loss_scales: {image: 1.0, vector: 1.0, reward: 1.0, cont: 1.0, dyn: 0.5, rep: 0.1, actor: 1.0, critic: 1.0, slowreg: 1.0}
+  loss_scales: {image: 1.0, vector: 1.0, reward: 1.0, cont: 1.0, dyn: 0.5, rep: 0.1, actor: 1.0, critic: 1.0, slowreg: 1.0, rollout_reward: 1.0, rollout_cont: 1.0}
   dyn_loss: {impl: kl, free: 1.0}
   rep_loss: {impl: kl, free: 1.0}
   model_opt: {opt: adam, lr: 1e-4, eps: 1e-8, clip: 1000.0, wd: 0.0, warmup: 0, lateclip: 0.0}
@@ -100,6 +100,38 @@ defaults:
   disag_head: {layers: 5, units: 1024, act: silu, norm: layer, dist: mse, outscale: 1.0, inputs: [deter, stoch, action], winit: normal, fan: avg}
   disag_target: [stoch]
   disag_models: 8
+
+  # pcwm-related
+  multi_step_length: 0
+  no_recon: False
+  downsample_method: fps_multi
+  n_downsample_pts: 1024 # placeholder
+  depth_max: 1000 # mm, placeholder
+  use_pcd: False
+  pcd_enc_typ: pcwm_pointconv
+  pcwm_pointconv_encoder: 
+    mlp_keys: '.*' 
+    cnn_keys: '.*' 
+    act: silu
+    norm: layer
+    mlp_layers: 5
+    mlp_units: 1024
+    cnn: resnet 
+    cnn_depth: 96
+    cnn_blocks: 0
+    resize: stride
+    winit: normal
+    fan: avg
+    symlog_inputs: True
+    minres: 4
+    # pcwm-specific
+    npoints: [512, 256, 128, 64]
+    nsamples: [16, 16, 16, 16]
+    mlp: [16, 16]
+    out_channels: [32, 64, 128, 256]
+    pcd_norm : layer
+    pcd_act : leakyrelu
+  shift: False
 
 minecraft:
 
@@ -266,3 +298,34 @@ debug:
   .*\.layers: 2
   .*\.units: 16
   .*\.wd$: 0.0
+
+maniskill2_liftcube_pcwm:
+  task: maniskill2_LiftCube-v0
+  run: 
+    steps: 1.1e6
+    train_ratio: 512
+  envs.amount: 1
+  env.maniskill2.cam_name : base_camera
+  env.maniskill2.obs_frame : base_pose
+  env.maniskill2.use_segmented_pts : True
+  env.maniskill2.obs_mode : pointcloud+rgb
+  grad_heads: [reward, cont]
+  batch_size: 8
+  multi_step_length: 2
+  pcd_enc_typ: pcwm_pointconv
+
+  .*\.units: 512
+  rssm.units: 256
+  rssm.deter: 256
+  rssm.classes: 0
+  rssm.stoch: 32
+  use_pcd: True
+
+  reward_head.layers: 2
+  reward_head.units: 512
+  cont_head.layers: 2
+  cont_head.units: 512
+  actor.layers: 2
+  actor.units: 512
+  critic.layers: 2  
+

@@ -18,6 +18,7 @@ __package__ = directory.name
 
 import embodied
 from embodied import wrappers
+import numpy as np
 
 
 def main(argv=None):
@@ -30,7 +31,8 @@ def main(argv=None):
   config = embodied.Flags(config).parse(other)
   args = embodied.Config(
       **config.run, logdir=config.logdir,
-      batch_steps=config.batch_size * config.batch_length)
+      batch_steps=config.batch_size * config.batch_length,
+      action_repeat=config.env.get(config.task.split('_')[0], {}).get('repeat', 1),)
   print(config)
 
   logdir = embodied.Path(args.logdir)
@@ -41,28 +43,47 @@ def main(argv=None):
 
   cleanup = []
   try:
+    env = make_envs(config)
+
+    if config.use_pcd:
+      obs_mode = config.env.maniskill2.obs_mode
+      pcd_dim = 6 if "rgb" in obs_mode else 3
+
+      obs_space = env.obs_space.copy()
+      assert 'pointcloud' in obs_space
+
+      obs_space['raw_pointcloud'] = obs_space['pointcloud']
+      if config.downsample_method=='fps_multi':
+        assert 'pointconv' in config.pcd_enc_typ
+        pcd_enc_config = getattr(config, config.pcd_enc_typ+'_encoder')
+        num_pts = config.env.maniskill2.n_downsample_pts + sum(pcd_enc_config.npoints)
+        obs_space["pointcloud"] = embodied.Space(np.float32, (num_pts, pcd_dim))
+      elif config.downsample_method is not None:
+        obs_space["pointcloud"] = embodied.Space(np.float32, (config.env.maniskill2.n_downsample_pts, pcd_dim))
+
+      config = config.update({
+        'n_downsample_pts': config.env.maniskill2.n_downsample_pts,
+        'depth_max': config.env.maniskill2.depth_max_mm,
+      })
 
     if args.script == 'train':
       replay = make_replay(config, logdir / 'replay')
-      env = make_envs(config)
       cleanup.append(env)
-      agent = agt.Agent(env.obs_space, env.act_space, step, config)
+      agent = agt.Agent(obs_space, env.act_space, step, config)
       embodied.run.train(agent, env, replay, logger, args)
 
     elif args.script == 'train_save':
       replay = make_replay(config, logdir / 'replay')
-      env = make_envs(config)
       cleanup.append(env)
-      agent = agt.Agent(env.obs_space, env.act_space, step, config)
+      agent = agt.Agent(obs_space, env.act_space, step, config)
       embodied.run.train_save(agent, env, replay, logger, args)
 
     elif args.script == 'train_eval':
       replay = make_replay(config, logdir / 'replay')
       eval_replay = make_replay(config, logdir / 'eval_replay', is_eval=True)
-      env = make_envs(config)
       eval_env = make_envs(config)  # mode='eval'
       cleanup += [env, eval_env]
-      agent = agt.Agent(env.obs_space, env.act_space, step, config)
+      agent = agt.Agent(obs_space, env.act_space, step, config)
       embodied.run.train_eval(
           agent, env, eval_env, replay, eval_replay, logger, args)
 
@@ -74,24 +95,22 @@ def main(argv=None):
       else:
         assert 0 < args.eval_fill <= config.replay_size // 10, args.eval_fill
         eval_replay = make_replay(config, logdir / 'eval_replay', is_eval=True)
-      env = make_envs(config)
       cleanup.append(env)
-      agent = agt.Agent(env.obs_space, env.act_space, step, config)
+      agent = agt.Agent(obs_space, env.act_space, step, config)
       embodied.run.train_holdout(
           agent, env, replay, eval_replay, logger, args)
 
     elif args.script == 'eval_only':
-      env = make_envs(config)  # mode='eval'
+      # mode='eval'
       cleanup.append(env)
-      agent = agt.Agent(env.obs_space, env.act_space, step, config)
+      agent = agt.Agent(obs_space, env.act_space, step, config)
       embodied.run.eval_only(agent, env, logger, args)
 
     elif args.script == 'parallel':
       assert config.run.actor_batch <= config.envs.amount, (
           config.run.actor_batch, config.envs.amount)
       step = embodied.Counter()
-      env = make_env(config)
-      agent = agt.Agent(env.obs_space, env.act_space, step, config)
+      agent = agt.Agent(obs_space, env.act_space, step, config)
       env.close()
       replay = make_replay(config, logdir / 'replay', rate_limit=True)
       embodied.run.parallel(
@@ -107,6 +126,7 @@ def main(argv=None):
 
 def make_logger(parsed, logdir, step, config):
   multiplier = config.env.get(config.task.split('_')[0], {}).get('repeat', 1)
+  
   logger = embodied.Logger(step, [
       embodied.logger.TerminalOutput(config.filter),
       embodied.logger.JSONLOutput(logdir, 'metrics.jsonl'),
@@ -169,7 +189,9 @@ def make_env(config, **overrides):
       'minecraft': 'embodied.envs.minecraft:Minecraft',
       'loconav': 'embodied.envs.loconav:LocoNav',
       'pinpad': 'embodied.envs.pinpad:PinPad',
+      'maniskill2': 'embodied.envs.maniskill2:FromManiskill2',
   }[suite]
+
   if isinstance(ctor, str):
     module, cls = ctor.split(':')
     module = importlib.import_module(module)
@@ -177,6 +199,7 @@ def make_env(config, **overrides):
   kwargs = config.env.get(suite, {})
   kwargs.update(overrides)
   env = ctor(task, **kwargs)
+
   return wrap_env(env, config)
 
 

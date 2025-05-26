@@ -18,6 +18,8 @@ from . import jaxutils
 from . import nets
 from . import ninjax as nj
 
+from pointclouds import encoders as pcd_nets
+from pointclouds import downsample
 
 @jaxagent.Wrapper
 class Agent(nj.Module):
@@ -38,6 +40,18 @@ class Agent(nj.Module):
     else:
       self.expl_behavior = getattr(behaviors, config.expl_behavior)(
           self.wm, self.act_space, self.config, name='expl_behavior')
+    self.use_pcd = config.use_pcd
+    if config.use_pcd:
+      if config.downsample_method == 'fps':
+        self.downsampler = downsample.FPS(self.wm.encoder.npoints, name='ds')
+      elif config.downsample_method == 'fps_multi':
+        downsample_pts = (config.n_downsample_pts,) + self.wm.encoder.npoints
+        self.downsampler = downsample.MultiFPS(
+                            downsample_pts, name='ds')
+      else:
+        self.downsampler = lambda points, mode: points
+      
+
 
   def policy_initial(self, batch_size):
     return (
@@ -52,7 +66,7 @@ class Agent(nj.Module):
     self.config.jax.jit and print('Tracing policy function.')
     obs = self.preprocess(obs)
     (prev_latent, prev_action), task_state, expl_state = state
-    embed = self.wm.encoder(obs)
+    embed = self.wm.encoder(obs, mode)
     latent, _ = self.wm.rssm.obs_step(
         prev_latent, prev_action, embed, obs['is_first'])
     self.expl_behavior.policy(latent, expl_state)
@@ -106,6 +120,7 @@ class Agent(nj.Module):
     for key, value in obs.items():
       if key.startswith('log_') or key in ('key',):
         continue
+
       if len(value.shape) > 3 and value.dtype == jnp.uint8:
         value = jaxutils.cast_to_compute(value) / 255.0
       else:
@@ -114,6 +129,8 @@ class Agent(nj.Module):
     obs['cont'] = 1.0 - obs['is_terminal'].astype(jnp.float32)
     return obs
 
+  def downsample(self, points, mode='train'):
+    return self.downsampler(points, mode)
 
 class WorldModel(nj.Module):
 
@@ -123,17 +140,37 @@ class WorldModel(nj.Module):
     self.config = config
     shapes = {k: tuple(v.shape) for k, v in obs_space.items()}
     shapes = {k: v for k, v in shapes.items() if not k.startswith('log_')}
-    self.encoder = nets.MultiEncoder(shapes, **config.encoder, name='enc')
-    self.rssm = nets.RSSM(**config.rssm, name='rssm')
-    self.heads = {
-        'decoder': nets.MultiDecoder(shapes, **config.decoder, name='dec'),
-        'reward': nets.MLP((), **config.reward_head, name='rew'),
-        'cont': nets.MLP((), **config.cont_head, name='cont')}
+    if config.use_pcd:
+      match config.pcd_enc_typ:
+        case 'pcwm_pointconv':
+          self.encoder = pcd_nets.PointConvEncoder_PCWM(
+            shapes, **config.pcwm_pointconv_encoder, 
+            name='enc', presample=config.downsample_method == 'fps_multi')
+    else:
+      self.encoder = nets.MultiEncoder(shapes, **config.encoder, name='enc')
+    self.rssm = nets.RSSM(**config.rssm, 
+                          multi_step_length=config.multi_step_length, 
+                          shift=config.shift,
+                          name='rssm')
+    self.multi_step_length = config.multi_step_length
+    self.heads = {}
+    for grad_head in config.grad_heads:
+      if grad_head == 'decoder':
+        self.heads['decoder'] = nets.MultiDecoder(
+            shapes, **config.decoder, name='dec')
+      elif grad_head == 'reward':
+        self.heads['reward'] = nets.MLP((), **config.reward_head, name='rew')
+      elif grad_head == 'cont':
+        self.heads['cont'] = nets.MLP((), **config.cont_head, name='cont')
+      else:
+        raise NotImplementedError(grad_head)
+
     self.opt = jaxutils.Optimizer(name='model_opt', **config.model_opt)
     scales = self.config.loss_scales.copy()
-    image, vector = scales.pop('image'), scales.pop('vector')
-    scales.update({k: image for k in self.heads['decoder'].cnn_shapes})
-    scales.update({k: vector for k in self.heads['decoder'].mlp_shapes})
+    if 'decoder' in self.heads:
+      image, vector = scales.pop('image'), scales.pop('vector')
+      scales.update({k: image for k in self.heads['decoder'].cnn_shapes})
+      scales.update({k: vector for k in self.heads['decoder'].mlp_shapes})
     self.scales = scales
 
   def initial(self, batch_size):
@@ -148,19 +185,28 @@ class WorldModel(nj.Module):
     metrics.update(mets)
     return state, outs, metrics
 
-  def loss(self, data, state):
-    embed = self.encoder(data)
+  def loss(self, data, state, mode='train'):
+    embed = self.encoder(data, mode)
     prev_latent, prev_action = state
     prev_actions = jnp.concatenate([
         prev_action[:, None], data['action'][:, :-1]], 1)
-    post, prior = self.rssm.observe(
+    post, prior, rollouts = self.rssm.observe(
         embed, prev_actions, data['is_first'], prev_latent)
     dists = {}
+    rollout_dists = {}
     feats = {**post, 'embed': embed}
+
     for name, head in self.heads.items():
       out = head(feats if name in self.config.grad_heads else sg(feats))
       out = out if isinstance(out, dict) else {name: out}
       dists.update(out)
+
+    if self.config.multi_step_length>0:
+      for name, head in self.heads.items():
+        out = head(rollouts if name in self.config.grad_heads else sg(rollouts))
+        out = out if isinstance(out, dict) else {name: out}
+        rollout_dists.update(out)
+
     losses = {}
     losses['dyn'] = self.rssm.dyn_loss(post, prior, **self.config.dyn_loss)
     losses['rep'] = self.rssm.rep_loss(post, prior, **self.config.rep_loss)
@@ -168,15 +214,42 @@ class WorldModel(nj.Module):
       loss = -dist.log_prob(data[key].astype(jnp.float32))
       assert loss.shape == embed.shape[:2], (key, loss.shape)
       losses[key] = loss
-    scaled = {k: v * self.scales[k] for k, v in losses.items()}
+
+    for key, rollout_dist in rollout_dists.items():
+      H = self.config.multi_step_length
+      T = data[key].shape[1]
+      shift = self.config.shift
+      gt_slices = jax.vmap(
+          lambda t: jax.lax.dynamic_slice(
+              data[key], 
+              (0, t+shift) + (0,) * (data[key].ndim - 2),  # start indices
+              (data[key].shape[0], H) + data[key].shape[2:]  # slice sizes
+          )
+      )(jnp.arange(H, T-H+(1-shift)))
+  
+      gt = jnp.transpose(gt_slices, (1, 0, 2) + tuple(range(3, len(gt_slices.shape))))
+      loss = -rollout_dist.log_prob(gt.astype(jnp.float32))
+      # assert loss.shape == embed.shape[:2], (key, loss.shape)
+      losses["rollout_"+key] = loss
+    
+    scaled = {k: v * self.scales[k] for k, v in losses.items() if "rollout_" not in k}
+    rollout_scaled = {k: v * self.scales[k] for k, v in losses.items() if "rollout_" in k}
     model_loss = sum(scaled.values())
+    rollout_model_loss = sum(rollout_scaled.values())
+
     out = {'embed':  embed, 'post': post, 'prior': prior}
     out.update({f'{k}_loss': v for k, v in losses.items()})
     last_latent = {k: v[:, -1] for k, v in post.items()}
     last_action = data['action'][:, -1]
     state = last_latent, last_action
     metrics = self._metrics(data, dists, post, prior, losses, model_loss)
-    return model_loss.mean(), (state, out, metrics)
+    
+    metrics.update({k: v.mean() for k, v in rollout_scaled.items()})
+
+    total_loss = model_loss.mean() + rollout_model_loss.mean() \
+      if self.config.multi_step_length > 0 else model_loss.mean()
+
+    return total_loss, (state, out, metrics)
 
   def imagine(self, policy, start, horizon):
     first_cont = (1.0 - start['is_terminal']).astype(jnp.float32)
@@ -198,9 +271,11 @@ class WorldModel(nj.Module):
     return traj
 
   def report(self, data):
+    if 'decoder' not in self.heads:
+      return {}
     state = self.initial(len(data['is_first']))
     report = {}
-    report.update(self.loss(data, state)[-1][-1])
+    report.update(self.loss(data, state, mode='eval')[-1][-1])
     context, _ = self.rssm.observe(
         self.encoder(data)[:6, :5], data['action'][:6, :5],
         data['is_first'][:6, :5])

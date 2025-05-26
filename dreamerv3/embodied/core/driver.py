@@ -4,7 +4,6 @@ import numpy as np
 
 from .basics import convert
 
-
 class Driver:
 
   _CONVERSION = {
@@ -20,6 +19,7 @@ class Driver:
     self._kwargs = kwargs
     self._on_steps = []
     self._on_episodes = []
+    self._collected_steps = 0
     self.reset()
 
   def reset(self):
@@ -36,17 +36,23 @@ class Driver:
   def on_episode(self, callback):
     self._on_episodes.append(callback)
 
-  def __call__(self, policy, steps=0, episodes=0):
+  def __call__(self, policy, steps=0, episodes=0, downsampler=None):
     step, episode = 0, 0
     while step < steps or episode < episodes:
-      step, episode = self._step(policy, step, episode)
+      step, episode = self._step(policy, step, episode, downsampler)
 
-  def _step(self, policy, step, episode):
+  def _step(self, policy, step, episode, downsampler=None):
     assert all(len(x) == len(self._env) for x in self._acts.values())
     acts = {k: v for k, v in self._acts.items() if not k.startswith('log_')}
     obs = self._env.step(acts)
     obs = {k: convert(v) for k, v in obs.items()}
     assert all(len(x) == len(self._env) for x in obs.values()), obs
+
+    if downsampler is not None:
+      assert 'pointcloud' in obs
+      obs['raw_pointcloud'] = obs['pointcloud'].copy()
+      obs['pointcloud'] = downsampler(obs['pointcloud'], "eval")
+
     acts, self._state = policy(obs, self._state, **self._kwargs)
     acts = {k: convert(v) for k, v in acts.items()}
     if obs['is_last'].any():
@@ -70,6 +76,9 @@ class Driver:
           ep = {k: convert(v) for k, v in self._eps[i].items()}
           [fn(ep.copy(), i, **self._kwargs) for fn in self._on_episodes]
           episode += 1
+    self._collected_steps += len(obs['is_first'])
+    if self._collected_steps % 100 == 0:
+      print(f'Collected {self._collected_steps} steps.')
     return step, episode
 
   def _expand(self, value, dims):

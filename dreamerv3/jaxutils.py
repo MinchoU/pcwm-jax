@@ -474,3 +474,72 @@ class SlowUpdater:
         lambda s, d: mix * s + (1 - mix) * d,
         source, self.dst.getm()))
     self.updates.write(updates + 1)
+
+
+def available(*trees, bdims=None):
+  def fn(*xs):
+    masks = []
+    for x in xs:
+      if jnp.issubdtype(x.dtype, jnp.floating):
+        mask = (x != -jnp.inf)
+      elif jnp.issubdtype(x.dtype, jnp.signedinteger):
+        mask = (x != -1)
+      elif (
+          jnp.issubdtype(x.dtype, jnp.unsignedinteger) or
+          jnp.issubdtype(x.dtype, bool)):
+        shape = x.shape if bdims is None else x.shape[:bdims]
+        mask = jnp.full(shape, True, bool)
+      else:
+        raise NotImplementedError(x.dtype)
+      if bdims is not None:
+        mask = mask.all(tuple(range(bdims, mask.ndim)))
+      masks.append(mask)
+    return jnp.stack(masks, 0).all(0)
+  return jax.tree.map(fn, *trees)
+
+def where(condition, xs, ys):
+  assert condition.dtype == bool, condition.dtype
+  def fn(x, y):
+    assert x.shape == y.shape, (x.shape, y.shape)
+    expanded = jnp.expand_dims(condition, list(range(condition.ndim, x.ndim)))
+    return jnp.where(expanded, x, y)
+  return jax.tree.map(fn, xs, ys)
+
+
+def mask(xs, mask):
+  return where(mask, xs, jax.tree.map(jnp.zeros_like, xs))
+
+class DictConcat:
+
+  def __init__(self, spaces, fdims, squish=lambda x: x):
+    assert 1 <= fdims, fdims
+    self.keys = sorted(spaces.keys())
+    self.spaces = spaces
+    self.fdims = fdims
+    self.squish = squish
+
+  def __call__(self, xs):
+    assert all(k in xs for k in self.spaces), (self.spaces, xs.keys())
+    bdims = xs[self.keys[0]].ndim - len(self.spaces[self.keys[0]])
+    ys = []
+    for key in self.keys:
+      space = self.spaces[key]
+      x = xs[key]
+      m = available(x, bdims=bdims)
+      x = mask(x, m)
+      assert x.shape[bdims:] == space, (key, bdims, space, x.shape)
+      if space.dtype == jnp.uint8 and len(space) in (2, 3):
+        raise NotImplementedError('Images are not supported.')
+      elif space.discrete:
+        classes = np.asarray(space.classes).flatten()
+        assert (classes == classes[0]).all(), classes
+        classes = classes[0].item()
+        x = x.astype(jnp.int32)
+        x = jax.nn.one_hot(x, classes, dtype=COMPUTE_DTYPE)
+      else:
+        x = self.squish(x)
+        x = x.astype(COMPUTE_DTYPE)
+      x = mask(x, m)
+      x = x.reshape((*x.shape[:bdims + self.fdims - 1], -1))
+      ys.append(x)
+    return jnp.concatenate(ys, -1)

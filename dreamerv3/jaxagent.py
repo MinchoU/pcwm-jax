@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from . import jaxutils
+import pointclouds.nn_utils 
 from . import ninjax as nj
 
 tree_map = jax.tree_util.tree_map
@@ -150,6 +151,7 @@ class JAXAgent(embodied.Agent):
     if self.config.platform == 'cpu':
       jax.config.update('jax_disable_most_optimizations', self.config.debug)
     jaxutils.COMPUTE_DTYPE = getattr(jnp, self.config.precision)
+    pointclouds.nn_utils.COMPUTE_DTYPE = getattr(jnp, self.config.precision)
 
   def _transform(self):
     self._init_policy = nj.pure(lambda x: self.agent.policy_initial(len(x)))
@@ -157,6 +159,9 @@ class JAXAgent(embodied.Agent):
     self._policy = nj.pure(self.agent.policy)
     self._train = nj.pure(self.agent.train)
     self._report = nj.pure(self.agent.report)
+
+    self._downsample = nj.pure(self.agent.downsample)
+    
     if len(self.train_devices) == 1:
       kw = dict(device=self.train_devices[0])
       self._init_train = nj.jit(self._init_train, **kw)
@@ -171,10 +176,13 @@ class JAXAgent(embodied.Agent):
       kw = dict(device=self.policy_devices[0])
       self._init_policy = nj.jit(self._init_policy, **kw)
       self._policy = nj.jit(self._policy, static=['mode'], **kw)
+
+      self._downsample = nj.jit(self._downsample, static=['mode'], **kw)
     else:
       kw = dict(devices=self.policy_devices)
       self._init_policy = nj.pmap(self._init_policy, 'i', **kw)
       self._policy = nj.pmap(self._policy, 'i', static=['mode'], **kw)
+      self._downsample = nj.pmap(self._downsample, 'i', static=['mode'], **kw)
 
   def _convert_inps(self, value, devices):
     if len(devices) == 1:
@@ -238,3 +246,11 @@ class JAXAgent(embodied.Agent):
     for dim in reversed(batch_dims):
       data = {k: np.repeat(v[None], dim, axis=0) for k, v in data.items()}
     return data
+
+  def downsample(self, points, mode="train"):
+    points = jax.device_put(points, self.policy_devices[0])
+    rng = self._next_rngs(self.policy_devices)
+    new_points, _ = self._downsample({}, rng, points, mode=mode)
+    if mode != "train":
+      new_points = jax.device_get(new_points)
+    return new_points
