@@ -2,7 +2,11 @@
 
 Unofficial reproduction of [PCWM](https://arxiv.org/pdf/2404.18926) (Point Cloud Models Improve Visual Robustness in Robotic Learners) based on original [DreamerV3](https://arxiv.org/pdf/2301.04104v1) implementation.
 
-Currently tested on only the `LiftCube-v0` environment for training. To run this first install mani_skill2,
+Currently tested on only the `LiftCube-v0` environment for training. 
+
+![LiftCube Training Curve](pcwm_seed1.png)
+
+To run this first install mani_skill2,
 
 ```
 pip install mani_skill2
